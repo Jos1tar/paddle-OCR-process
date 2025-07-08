@@ -1,98 +1,191 @@
 import cv2
 import numpy as np
-from shapely.geometry import Polygon
-import pyclipper
+import paddle.inference as paddle_infer
+
+import pre_processor
+import post_processor
 
 
-def postprocess_det(pred, ori_shape, resize_shape, box_thresh=0.3, unclip_ratio=2.0):
+
+def load_paddle_model(model_dir):
     """
-    将模型输出的概率图转换为文本框坐标（带 unclip）
-    :param pred: 模型输出，shape = (1, 1, H, W)
-    :param ori_shape: 原图尺寸 [H_ori, W_ori]
-    :param resize_shape: 模型输入图尺寸 [H_resized, W_resized]
-    :param box_thresh: 二值化阈值
-    :param unclip_ratio: 多边形膨胀比（模拟 DBNet 的行为）
-    :return: list of boxes， 每个 box 是 shape=(N, 2) 的坐标点组成的 numpy array
+    加载 Paddle 推理模型（.pdmodel/.pdiparams）
+    :param model_dir: 模型所在文件夹路径（里面应有 *.pdmodel 和 *.pdiparams）
     """
-    pred = pred[0, 0]  # 去除 batch 和 channel
-
-    # 1. 二值化概率图
-    _, bin_map = cv2.threshold(pred, box_thresh, 1, cv2.THRESH_BINARY)
-    bin_map = (bin_map * 255).astype(np.uint8)
-
-    # 2. 找轮廓
-    contours, _ = cv2.findContours(bin_map, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-    h_ori, w_ori = ori_shape
-    h_resize, w_resize = resize_shape
-    ratio_h = h_ori / h_resize
-    ratio_w = w_ori / w_resize
-
-    boxes = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < 100:
-            continue
-        rect = cv2.minAreaRect(cnt)
-        box = cv2.boxPoints(rect)
-        box = np.array(box, dtype=np.float32)
-
-        #  膨胀 polygon
-        box = unclip_polygon(box, unclip_ratio=unclip_ratio)
-
-        # 有可能变成非矩形（例如 6 点），检查一下合法性
-        if box.shape[0] < 4:
-            continue
-
-        # 缩放回原图尺寸
-        box[:, 0] *= ratio_w
-        box[:, 1] *= ratio_h
-
-        boxes.append(box)
-
-    return boxes
+    config = paddle_infer.Config(
+        model_dir + "/inference.pdmodel",
+        model_dir + "/inference.pdiparams"
+    )
+    config.enable_use_gpu(1024, 0)  # 使用 GPU，如使用 CPU 可注释掉这行
+    predictor = paddle_infer.create_predictor(config)
+    return predictor
 
 
-def postprocess_cls(logits):
+
+def run_det_model(predictor, input_tensor):
     """
-    :param logits: 分类输出 [B, 2]，表示 [正向, 反向] 概率
-    :return: 每张图是否需要旋转
+    :param predictor: Paddle detection predictor
+    :param input_tensor: shape = [1, 3, H, W]
+    :return: shape = [1, 1, H, W]（概率图）
     """
-    pred = np.argmax(logits, axis=1)  # 0 表示不转，1 表示旋转 180°
-    return pred.tolist()
+    input_tensor = input_tensor.astype('float32')
+    input_name = predictor.get_input_names()[0]
+    input_handle = predictor.get_input_handle(input_name)
+    input_handle.copy_from_cpu(input_tensor)
 
-def ctc_decode(preds, charset, remove_duplicate=True):
+    predictor.run()
+
+    output_name = predictor.get_output_names()[0]
+    output_handle = predictor.get_output_handle(output_name)
+    output_data = output_handle.copy_to_cpu()
+
+    return output_data  # shape: [1, 1, H, W]
+
+
+
+def run_cls_model(predictor, input_tensor):
     """
-    :param preds: shape = [T, num_classes]，经过 softmax 的概率
-    :param charset: 字符集列表，如 ["a", "b", ..., "z", "0", ..., "9"]
-    :return: 解码得到的字符串
+    调用分类模型执行预测
+    :param predictor: Paddle predictor
+    :param input_tensor: shape [1, C, H, W]
+    :return: softmax概率 [1, 2]
     """
-    max_index = np.argmax(preds, axis=1)
-    last_char = -1
-    result = []
+    input_tensor = input_tensor.astype('float32')
 
-    for i in max_index:
-        # CTC 解码时，确保 charset[0] 是 blank，或显式指定 blank 索引
-        # if i != blank_index and ...
-        if i != 0 and (not remove_duplicate or i != last_char):
-            # charset[i] 需确保 i < len(charset)
-            result.append(charset[i])
-        last_char = i
+    # 获取输入名和句柄
+    input_name = predictor.get_input_names()[0]
+    input_handle = predictor.get_input_handle(input_name)
+    input_handle.copy_from_cpu(input_tensor)
 
-    return ''.join(result)
+    # 推理
+    predictor.run()
+
+    # 获取输出
+    output_name = predictor.get_output_names()[0]
+    output_handle = predictor.get_output_handle(output_name)
+    output_data = output_handle.copy_to_cpu()  # shape [1, 2]
+
+    return output_data  # 直接返回 logits 或概率
+
+def run_rec_model(predictor, input_tensor):
+    """
+    :param predictor: Paddle recognition predictor
+    :param input_tensor: shape = [1, 3, 32, W]
+    :return: shape = [T, num_classes]，T为时间步
+    """
+    input_tensor = input_tensor.astype('float32')
+    input_name = predictor.get_input_names()[0]
+    input_handle = predictor.get_input_handle(input_name)
+    input_handle.copy_from_cpu(input_tensor)
+
+    predictor.run()
+
+    output_name = predictor.get_output_names()[0]
+    output_handle = predictor.get_output_handle(output_name)
+    output_data = output_handle.copy_to_cpu()  # shape: [1, T, num_classes]
+
+    # 去掉 batch 维度，得到 [T, num_classes]
+    return output_data[0]
+
+def load_charset(txt_path):
+    with open(txt_path, 'r', encoding='utf-8') as f:
+        charset = [line.strip() for line in f]
+    return ['blank'] + charset  # 第一个为 CTC blank
+
+charset = load_charset('ppocr_keys_v1.txt')
+
+def visualize_boxes(image_path, boxes):
+    img = cv2.imread(image_path)
+    for box in boxes:
+        pts = np.array(box, dtype=np.int32).reshape((-1,1,2))
+        cv2.polylines(img, [pts], isClosed=True, color=(0,255,0), thickness=2)
+    cv2.imwrite('debug_boxes.jpg', img)
 
 
-def unclip_polygon(box, unclip_ratio=2.0):
-    """对 box 多边形做膨胀"""
-    poly = Polygon(box)
-    area = poly.area
-    perimeter = poly.length
-    if perimeter == 0:
-        return box
-    distance = area * unclip_ratio / perimeter
+def ocr_pipeline(image_path):
+    # === 1. 检测阶段 ===
+    det_config = {
+        'limit_side_len': 1280,
+        'mean': [0.485, 0.456, 0.406],
+        'std': [0.229, 0.224, 0.225]
+    }
+    det_data = pre_processor.preprocess_for_task(image_path, task_type='det',**det_config)
+    print("检测预处理结果:", det_data['image'].shape)
+    det_input = np.expand_dims(det_data['image'], axis=0)  # [1, C, H, W]
+    det_model = load_paddle_model('./ch_PP-OCRv3_det_infer')
+    # 在循环外加载分类和识别模型，避免重复加载
+    cls_model = load_paddle_model("./ch_ppocr_mobile_v2.0_cls_infer")
+    rec_model = load_paddle_model('./ch_PP-OCRv3_rec_infer')
+    det_pred = run_det_model(det_model,det_input)
 
-    offset = pyclipper.PyclipperOffset()
-    offset.AddPath(box.astype(np.int32), pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
-    expanded = offset.Execute(distance)
-    if len(expanded) == 0:
-        return box
-    return np.array(expanded[0], dtype=np.float32)
+    ori_shape = det_data['ori_shape']
+    resize_shape = det_data['shape']
+    boxes = post_processor.postprocess_det(det_pred, ori_shape, resize_shape)
+
+    print(f"[检测] 共检测到 {len(boxes)} 个文本框")
+
+    # === 2. 对每个框进行抠图 ===
+    image = cv2.imread(image_path)
+    texts = []
+
+    for idx, box in enumerate(boxes):
+        # 获得旋转矩形框
+        rect = cv2.minAreaRect(box)
+        center, size, angle = rect
+        size = tuple([int(s) for s in size])
+
+        # 获取仿射矩阵并裁剪
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]))
+        cropped = cv2.getRectSubPix(rotated, size, center)
+
+        # === 3. 分类模型：判断是否需要旋转 ===
+        rec_config = {
+            'target_height': 60,
+            'max_width': 320,
+            'mean': [0.5, 0.5, 0.5],
+            'std': [0.5, 0.5, 0.5]
+        }
+        cls_data = pre_processor.preprocess_for_task(cropped, task_type='cls', **rec_config)
+        # 分类模型调试输出
+        print(f"[调试] Box {idx+1} cls_data['image'] shape: {cls_data['image'].shape}, min: {cls_data['image'].min()}, max: {cls_data['image'].max()}")
+        cls_input = np.expand_dims(cls_data['image'], axis=0)
+        cls_result = run_cls_model(cls_model, cls_input)[0]
+        print(f"[调试] Box {idx+1} cls_result shape: {cls_result.shape}, value: {cls_result}, argmax: {np.argmax(cls_result)}")
+        is_rotated = post_processor.postprocess_cls([cls_result])[0]
+
+        if is_rotated == 1:
+            cropped = cv2.rotate(cropped, cv2.ROTATE_180)
+
+        # === 4. 识别模型 ===
+        rec_data = pre_processor.preprocess_for_task(
+            cropped,
+            task_type='rec',
+            batch_size=1,
+            target_height=32,
+            max_width=320,
+            mean=[0.5, 0.5, 0.5],   # 明确指定
+            std=[0.5, 0.5, 0.5],    # 明确指定
+            scale=1.0/255.          # 明确指定
+        )
+        # 调试输出预处理后 shape 和数值范围
+        print(f"[调试] Box {idx+1} rec_data['image'] shape: {rec_data['image'].shape}, min: {rec_data['image'].min()}, max: {rec_data['image'].max()}")
+        # 识别模型推理
+        rec_input = np.expand_dims(rec_data['image'], axis=0)
+        rec_pred = run_rec_model(rec_model, rec_input)
+        print(f"[调试] Box {idx+1} rec_pred shape: {rec_pred.shape}, max prob idx: {np.argmax(rec_pred, axis=1)}")
+        # === 5. 解码 ===
+        text = post_processor.ctc_decode(rec_pred, charset)
+        if not text:
+            print(f"[警告] Box {idx+1} 识别结果为空，可能模型未输出有效字符。")
+        texts.append(text)
+
+    # === 输出结果 ===
+    print("[识别结果]")
+    visualize_boxes('mars.png', boxes)
+    for i, (box, text) in enumerate(zip(boxes, texts)):
+        print(f"Box {i + 1} 坐标: {box.astype(np.int32).tolist()} 识别: {text}")
+
+# === 执行测试 ===
+if __name__ == "__main__":
+    ocr_pipeline("mars.png")
