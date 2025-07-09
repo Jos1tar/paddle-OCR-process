@@ -30,14 +30,8 @@ class DecodeImage:
 
         # 记录原始尺寸 [H, W]
         data['ori_shape'] = np.array(data['image'].shape[:2])
+
         return data
-
-"""
-        # 通道顺序调整 (HWC -> CHW)
-        if self.channel_first:
-            data['image'] = data['image'].transpose((2, 0, 1))
-"""
-
 
 
 class DetResizeForTest:
@@ -54,108 +48,95 @@ class DetResizeForTest:
 
         # 计算缩放比例
         if self.limit_type == 'max':
-            ratio = min(self.limit_side_len / max(h, w), 1.0)
+            ratio = float(self.limit_side_len) / max(h, w)
         else:
-            ratio = min(self.limit_side_len / min(h, w), 1.0)
-
-        # 保持长宽比缩放
-        new_h = max(int(h * ratio), 1)
-        new_w = max(int(w * ratio), 1)
-
-        # 确保新尺寸能被divisor整除
-        new_w = (new_w + self.divisor - 1) // self.divisor * self.divisor
-        new_h = (new_h + self.divisor - 1) // self.divisor * self.divisor
+            ratio = float(self.limit_side_len) / min(h, w)
+        if ratio > 1.0:
+            ratio = 1.0
+        resize_h = int(h * ratio)
+        resize_w = int(w * ratio)
+        resize_h = max(self.divisor, int(round(resize_h / self.divisor)) * self.divisor)
+        resize_w = max(self.divisor, int(round(resize_w / self.divisor)) * self.divisor)
 
         # 执行缩放
-        resized_img = cv2.resize(img, (new_w, new_h))
+        resized_img = cv2.resize(img, (resize_w, resize_h))
 
         # 更新数据
         data['image'] = resized_img
-        data['shape'] = np.array([new_h, new_w])
-        data['ratio'] = ratio
+        data['shape'] = np.array([resize_h, resize_w])
+        data['ratio_h'] = resize_h / float(h)
+        data['ratio_w'] = resize_w / float(w)
         return data
 
 
 class ClsResizeForTest:
     """分类专用尺寸调整算子"""
 
-    def __init__(self, target_size=(48, 192)):
+    def __init__(self, image_shape=(3, 48, 192)):
         # 初始化目标尺寸：目标高度和宽度 (默认48高x192宽)
-        self.target_h, self.target_w = target_size
+        self.image_shape = image_shape
 
     def __call__(self, data):
         # 获取输入图像
         img = data['image']
-        assert img is not None and img.size > 0, "输入图像无效"
-
+        imgC, imgH, imgW = self.image_shape
         h, w = img.shape[:2]
-        assert h > 0 and w > 0, f"图像尺寸错误: {h}x{w}"
-
-        # 安全计算
-        ratio = self.target_h / max(float(h), 1e-6)  # 防除零
-        new_w = max(min(int(w * ratio), self.target_w), 1)  # 限制范围
-
-        # 执行缩放：将图像缩放到新尺寸 (新宽度x目标高度)
-        resized_img = cv2.resize(img, (new_w, self.target_h))
+        ratio = float(w) / float(h)
+        resized_w = imgW
+        if np.ceil(imgH * ratio) > imgW:
+            resized_w = imgW
+        else:
+            resized_w = int(np.ceil(imgH * ratio))
+        resized_img = cv2.resize(img, (resized_w, imgH))
 
         # 如果新宽度小于目标宽度，进行右侧填充
-        if new_w < self.target_w:
+        if resized_w < imgW:
             # 创建全零填充图像（目标高度x目标宽度）
-            padded_img = np.zeros((self.target_h, self.target_w, img.shape[2]),
-                                  dtype=resized_img.dtype)
+            padding_img = np.zeros((imgH, imgW, imgC), dtype=np.uint8)
             # 将缩放后的图像复制到填充图像的左侧
-            padded_img[:, :new_w] = resized_img
+            padding_img[:, 0:resized_w, :] = resized_img
             # 用填充后的图像替换原缩放图像
-            resized_img = padded_img
+            resized_img = padding_img
 
         # 更新数据字典中的图像
         data['image'] = resized_img
         # 存储调整后的尺寸信息
-        data['resized_shape'] = (self.target_h, self.target_w)
+        data['resized_shape'] = (imgH, imgW)
         return data
 
 
 class RecResizeForTest:
     """识别专用尺寸调整算子"""
 
-    def __init__(self, target_height=32, max_width=None, min_width=16):
+    def __init__(self, image_shape=(3, 32, 320)):
         # 初始化参数：目标高度、最大宽度限制、最小宽度限制
-        self.target_h = target_height
-        self.max_width = max_width
-        self.min_width = min_width
+        self.image_shape = image_shape
 
     def __call__(self, data):
         # 获取输入图像
         img = data['image']
-        # 获取图像原始高度和宽度
+        imgC, imgH, imgW = self.image_shape
         h, w = img.shape[:2]
+        ratio = w / float(h)
+        if np.ceil(imgH * ratio) > imgW:
+            resized_w = imgW
+        else:
+            resized_w = int(np.ceil(imgH * ratio))
+        resized_img = cv2.resize(img, (resized_w, imgH))
 
-        # 计算宽度缩放比例（保持高度固定为目标高度）
-        ratio = self.target_h / float(h)
-        # 计算新宽度（保持宽高比）
-        new_w = int(w * ratio)
-
-        # 如果设置了最大宽度且新宽度超过最大宽度
-        if self.max_width and new_w > self.max_width:
-            # 重新计算缩放比例（基于最大宽度限制）
-            ratio = self.max_width / float(w)
-            # 使用最大宽度作为新宽度
-            new_w = self.max_width
-            # 重新计算目标高度（保持宽高比）
-            self.target_h = max(int(h * ratio), 1)  # 确保高度至少为1像素
-
-        # 确保宽度不小于最小宽度限制
-        new_w = max(new_w, self.min_width)
-
-        # 执行缩放：将图像缩放到新尺寸 (新宽度x目标高度)
-        resized_img = cv2.resize(img, (new_w, self.target_h))
+        # 如果新宽度小于目标宽度，进行右侧填充
+        if resized_w < imgW:
+            # 创建全零填充图像（目标高度x目标宽度）
+            padding_img = np.zeros((imgH, imgW, imgC), dtype=np.uint8)
+            # 将缩放后的图像复制到填充图像的左侧
+            padding_img[:, 0:resized_w, :] = resized_img
+            # 用填充后的图像替换原缩放图像
+            resized_img = padding_img
 
         # 更新数据字典
         data['image'] = resized_img
         # 存储调整后的尺寸
-        data['resized_shape'] = (self.target_h, new_w)
-        # 存储宽高缩放比例（用于后续处理）
-        data['ratio'] = ratio
+        data['resized_shape'] = (imgH, imgW)
         return data
 
 
@@ -181,17 +162,7 @@ class NormalizeImage:
 
         # 第二步：标准化处理（减去均值，除以标准差）
         if self.mean is not None and self.std is not None:
-            # 处理灰度图（单通道）
-            if len(img.shape) == 2:  # 灰度图
-                # 使用第一个均值/标准差值
-                img = (img - self.mean[0]) / self.std[0]
-            else:
-                # 处理彩色图或多通道图像
-                if self.mean.size == 1:  # 单值mean/std（所有通道相同）
-                    img = (img - self.mean) / self.std
-                else:  # 多通道独立均值/标准差
-                    # 重塑为(1,1,C)形状以便广播
-                    img = (img - self.mean.reshape(1, 1, -1)) / self.std.reshape(1, 1, -1)
+            img = (img - self.mean.reshape(1, 1, -1)) / self.std.reshape(1, 1, -1)
 
         # 更新数据字典中的图像
         data['image'] = img
@@ -214,7 +185,7 @@ class ToCHWImage:
 class KeepKeys:
     """保留指定键值算子"""
 
-    def __init__(self, keep_keys=['image', 'shape', 'ratio', 'ori_shape']):
+    def __init__(self, keep_keys=['image', 'shape', 'ratio_h', 'ratio_w', 'ori_shape']):
         self.keep_keys = keep_keys
 
     def __call__(self, data):
@@ -238,9 +209,6 @@ class BatchPadding:
 
         # 创建批处理数组
         batch_images = []
-        batch_shapes = []
-        batch_ratios = []
-        batch_ori_shapes = []
 
         for data in batch_data:
             img = data['image']
@@ -251,16 +219,8 @@ class BatchPadding:
             padded_img[:, :h, :w] = img[:, :, :min(w, max_w)]
 
             batch_images.append(padded_img)
-            batch_shapes.append(data.get('shape', (h, w)))
-            batch_ratios.append(data.get('ratio', 1.0))
-            batch_ori_shapes.append(data.get('ori_shape', (h, w)))
 
-        return {
-            'image': np.array(batch_images),
-            'shape': np.array(batch_shapes),
-            'ratio': np.array(batch_ratios),
-            'ori_shape': np.array(batch_ori_shapes)
-        }
+        return {'image': np.array(batch_images)}
 
 
 def create_preprocess_pipeline(task_type, config):
@@ -277,27 +237,35 @@ def create_preprocess_pipeline(task_type, config):
             limit_type=config.get('limit_type', 'max'),
             divisor=config.get('divisor', 32)
         ))
+        pipeline.append(NormalizeImage(
+            mean=config.get('mean', [0.485, 0.456, 0.406]),
+            std=config.get('std', [0.229, 0.224, 0.225]),
+            scale=config.get('scale', 1. / 255.)
+        ))
+        pipeline.append(ToCHWImage())
+        pipeline.append(KeepKeys(keep_keys=['image', 'shape', 'ratio_h', 'ratio_w', 'ori_shape']))
     elif task_type == 'cls':
         pipeline.append(ClsResizeForTest(
-            target_size=config.get('target_size', (48, 192))
+            image_shape=config.get('image_shape', (3, 48, 192))
         ))
+        pipeline.append(NormalizeImage(
+            mean=config.get('mean', [0.5, 0.5, 0.5]),
+            std=config.get('std', [0.5, 0.5, 0.5]),
+            scale=config.get('scale', 1. / 255.)
+        ))
+        pipeline.append(ToCHWImage())
+        pipeline.append(KeepKeys(keep_keys=['image']))
     elif task_type == 'rec':
         pipeline.append(RecResizeForTest(
-            target_height=config.get('target_height', 32),
-            max_width=config.get('max_width', None),
-            min_width=config.get('min_width', 16)
+            image_shape=config.get('image_shape', (3, 32, 320))
         ))
-
-    # 通用后续处理
-    pipeline.append(NormalizeImage(
-        mean=config.get('mean', [0.485, 0.456, 0.406]),
-        std=config.get('std', [0.229, 0.224, 0.225]),
-        scale=config.get('scale', 1. / 255.)
-    ))
-    pipeline.append(ToCHWImage())
-    pipeline.append(KeepKeys(keep_keys=config.get('keep_keys',
-                                                  ['image', 'shape', 'ratio', 'ori_shape'])))
-
+        pipeline.append(NormalizeImage(
+            mean=config.get('mean', [0.5, 0.5, 0.5]),
+            std=config.get('std', [0.5, 0.5, 0.5]),
+            scale=config.get('scale', 1. / 255.)
+        ))
+        pipeline.append(ToCHWImage())
+        pipeline.append(KeepKeys(keep_keys=['image']))
     return pipeline
 
 
@@ -344,8 +312,8 @@ if __name__ == "__main__":
     # 检测任务示例
     det_config = {
         'limit_side_len': 960,
-        'mean': [0.485, 0.456, 0.406],
-        'std': [0.229, 0.224, 0.225]
+        'mean': [0.5, 0.5, 0.5],
+        'std': [0.5, 0.5, 0.5]
     }
     det_data = preprocess_for_task('mars.png', 'det', **det_config)
     print("检测预处理结果:", det_data['image'].shape)
@@ -353,14 +321,14 @@ if __name__ == "__main__":
     # 识别任务示例
 
     rec_config = {
-        'target_height': 32,
-        'max_width': 320,
+        'image_shape': (3, 32, 320),  # 明确指定图像形状
         'mean': [0.5, 0.5, 0.5],
-        'std': [0.5, 0.5, 0.5]
+        'std': [0.5, 0.5, 0.5],
+        'scale': 1.0 / 255.0
     }
     rec_data = preprocess_for_task('mars.png', 'rec', **rec_config)
     print("识别预处理结果:", rec_data['image'].shape)
 
     # 批处理示例 (2张图像)
-    batch_data = preprocess_for_task(['mars.png'], 'det', batch_size=2)
+    batch_data = preprocess_for_task(['mars.png'], 'det', batch_size=1)
     print("批处理结果:", batch_data['image'].shape)
