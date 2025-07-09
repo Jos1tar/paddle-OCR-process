@@ -4,95 +4,82 @@ from shapely.geometry import Polygon
 import pyclipper
 
 
-def postprocess_det(pred, ori_shape, resize_shape, box_thresh=0.5, unclip_ratio=2.0):
-    """
-    将模型输出的概率图转换为文本框坐标（带 unclip）
-    :param pred: 模型输出，shape = (1, 1, H, W)
-    :param ori_shape: 原图尺寸 [H_ori, W_ori]
-    :param resize_shape: 模型输入图尺寸 [H_resized, W_resized]
-    :param box_thresh: 二值化阈值
-    :param unclip_ratio: 多边形膨胀比（模拟 DBNet 的行为）
-    :return: list of boxes， 每个 box 是 shape=(N, 2) 的坐标点组成的 numpy array
-    """
-    pred = pred[0, 0]  # 去除 batch 和 channel
-
-    # 1. 二值化概率图
-    _, bin_map = cv2.threshold(pred, box_thresh, 1, cv2.THRESH_BINARY)
-    bin_map = (bin_map * 255).astype(np.uint8)
-
-    # 2. 找轮廓
-    contours, _ = cv2.findContours(bin_map, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-    h_ori, w_ori = ori_shape
-    h_resize, w_resize = resize_shape
-    ratio_h = h_ori / h_resize
-    ratio_w = w_ori / w_resize
-
-    boxes = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < 100:
-            continue
-        rect = cv2.minAreaRect(cnt)
-        box = cv2.boxPoints(rect)
-        box = np.array(box, dtype=np.float32)
-
-        #  膨胀 polygon
-        box = unclip_polygon(box, unclip_ratio=unclip_ratio)
-
-        # 有可能变成非矩形（例如 6 点），检查一下合法性
-        if box.shape[0] < 4:
-            continue
-
-        # 缩放回原图尺寸
-        box[:, 0] *= ratio_w
-        box[:, 1] *= ratio_h
-
-        boxes.append(box)
-
-    return boxes
-
-
-def postprocess_cls(logits):
-    """
-    :param logits: 分类输出 [B, 2]，表示 [正向, 反向] 概率
-    :return: 每张图是否需要旋转
-    """
-    pred = np.argmax(logits, axis=1)  # 0 表示不转，1 表示旋转 180°
-    return pred.tolist()
-
-def ctc_decode(preds, charset, remove_duplicate=True):
-    """
-    :param preds: shape = [T, num_classes]，经过 softmax 的概率
-    :param charset: 字符集列表，如 ["a", "b", ..., "z", "0", ..., "9"]
-    :return: 解码得到的字符串
-    """
-    max_index = np.argmax(preds, axis=1)
-    last_char = -1
-    result = []
-
-    for i in max_index:
-        # CTC 解码时，确保 charset[0] 是 blank，或显式指定 blank 索引
-        # if i != blank_index and ...
-        if i != 0 and (not remove_duplicate or i != last_char):
-            # charset[i] 需确保 i < len(charset)
-            result.append(charset[i])
-        last_char = i
-
-    return ''.join(result)
-
-
-def unclip_polygon(box, unclip_ratio=2.0):
-    """对 box 多边形做膨胀"""
+def unclip(box, unclip_ratio=3.0):
     poly = Polygon(box)
-    area = poly.area
-    perimeter = poly.length
-    if perimeter == 0:
-        return box
-    distance = area * unclip_ratio / perimeter
-
+    distance = poly.area * unclip_ratio / poly.length
     offset = pyclipper.PyclipperOffset()
     offset.AddPath(box.astype(np.int32), pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
     expanded = offset.Execute(distance)
     if len(expanded) == 0:
         return box
     return np.array(expanded[0], dtype=np.float32)
+
+def get_mini_boxes(contour):
+    bounding_box = cv2.minAreaRect(contour)
+    points = cv2.boxPoints(bounding_box)
+    points = np.array(points, dtype=np.float32)
+    start_idx = points.sum(axis=1).argmin()
+    box = np.roll(points, 4 - start_idx, axis=0)
+    return box, min(bounding_box[1])
+
+def box_score_fast(bitmap, box):
+    h, w = bitmap.shape
+    box = np.round(box, decimals=0).astype(np.int32)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [box], 1)
+    return cv2.mean(bitmap, mask)[0]
+
+def postprocess_det(pred, ori_shape, resize_shape, box_thresh=0.6, unclip_ratio=2.5, min_size=2):
+    pred = pred[0, 0]
+    height, width = pred.shape
+    # 阈值化
+    _, binary = cv2.threshold(pred, box_thresh, 1, cv2.THRESH_BINARY)
+    binary = (binary * 255).astype(np.uint8)
+    # 找轮廓
+    contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    scores = []
+    for contour in contours:
+        if cv2.contourArea(contour) < min_size:
+            continue
+        box, sside = get_mini_boxes(contour)
+        if sside < min_size+0.5:
+            continue
+        score = box_score_fast(pred, box)
+        if score < box_thresh:
+            continue
+        box = unclip(box, unclip_ratio=unclip_ratio)
+        if len(box) < 4:
+            continue
+        box, sside = get_mini_boxes(box)
+        if sside < min_size + 2:
+            continue
+        # 缩放回原图
+        h_ori, w_ori = ori_shape
+        h_resize, w_resize = resize_shape
+        ratio_h = float(h_ori) / float(h_resize)
+        ratio_w = float(w_ori) / float(w_resize)
+        box[:, 0] = np.clip(np.round(box[:, 0] * ratio_w), 0, w_ori)
+        box[:, 1] = np.clip(np.round(box[:, 1] * ratio_h), 0, h_ori)
+        boxes.append(box.astype(np.int32))
+    return boxes
+
+def postprocess_cls(logits):
+    exp_logits = np.exp(logits)
+    probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+    if logits.ndim == 1:
+        return [1] if probs[1] > 0.5 else [0]
+    else:
+        return [1 if p[1] > 0.5 else 0 for p in probs]
+
+
+
+def ctc_decode(preds, charset, remove_duplicate=True):
+    max_index = np.argmax(preds, axis=1)  # 直接取argmax
+    result = []
+    for i, idx in enumerate(max_index):
+        if remove_duplicate and i > 0 and idx == max_index[i-1]:
+            continue
+        if idx > 0 and idx < len(charset):  # 跳过空白符
+            result.append(charset[idx])
+    return ''.join(result)
