@@ -42,7 +42,6 @@ def run_det_model(predictor, input_tensor):
     return output_data  # shape: [1, 1, H, W]
 
 
-
 def run_cls_model(predictor, input_tensor):
     """
     调用分类模型执行预测
@@ -87,6 +86,29 @@ def run_rec_model(predictor, input_tensor):
     # 去掉 batch 维度，得到 [T, num_classes]
     return output_data[0]
 
+def get_rotate_crop_image(img, points):
+    points = np.array(points, dtype="float32")
+    img_crop_width = int(np.linalg.norm(points[0] - points[1]))
+    img_crop_height = int(np.linalg.norm(points[0] - points[3]))
+
+    if img_crop_width <= 0 or img_crop_height <= 0:
+        return None
+
+    dst_pts = np.array([
+        [0, 0],
+        [img_crop_width, 0],
+        [img_crop_width, img_crop_height],
+        [0, img_crop_height]
+    ], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(points, dst_pts)
+    dst_img = cv2.warpPerspective(img, M, (img_crop_width, img_crop_height), borderMode=cv2.BORDER_REPLICATE)
+
+    if img_crop_height / img_crop_width >= 1.5:
+        dst_img = np.rot90(dst_img)
+    return dst_img
+
+
 def load_charset(txt_path):
     with open(txt_path, 'r', encoding='utf-8') as f:
         charset = [line.strip() for line in f]
@@ -99,10 +121,17 @@ def visualize_boxes(image_path, boxes):
     for box in boxes:
         pts = np.array(box, dtype=np.int32).reshape((-1,1,2))
         cv2.polylines(img, [pts], isClosed=True, color=(0,255,0), thickness=2)
-    cv2.imwrite('debug_boxes.jpg', img)
+    cv2.imwrite('result/debug_boxes.jpg', img)
 
 
 def ocr_pipeline(image_path):
+    # 在ocr_pipeline开头添加字符集检查
+    print("字符集大小:", len(charset))
+    print("前10个字符:", charset[:10])
+
+    # 添加临时测试
+    test_text = "测试123"
+    print("字符集包含测试字符:", all(c in charset for c in test_text))
     # === 1. 检测阶段 ===
     det_config = {
         'limit_side_len': 960,
@@ -128,36 +157,42 @@ def ocr_pipeline(image_path):
     image = cv2.imread(image_path)
     texts = []
 
-    for box in boxes:
-        # 获得旋转矩形框
-        rect = cv2.minAreaRect(box)
-        center, size, angle = rect
-        size = tuple([int(s) for s in size])
-
-        # 获取仿射矩阵并裁剪
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]))
-        cropped = cv2.getRectSubPix(rotated, size, center)
+    # 修改这里，添加 enumerate 获取 i
+    for i, box in enumerate(boxes):
+        cropped = get_rotate_crop_image(image, box)
+        if cropped is None:
+            continue
 
         # === 3. 分类模型：判断是否需要旋转 ===
         rec_config = {
             'target_height': 32,
             'max_width': 320,
-            'mean': [0.5, 0.5, 0.5],
-            'std': [0.5, 0.5, 0.5]
+             'mean': [0.5, 0.5, 0.5],
+            'std': [0.5, 0.5, 0.5],
         }
         cls_data = pre_processor.preprocess_for_task(cropped, task_type='cls', **rec_config)
         #print("识别预处理结果:", rec_data['image'].shape)
         # 分类模型推理
         cls_input = np.expand_dims(cls_data['image'], axis=0)
-        cls_result = run_cls_model(cls_model, cls_input)[0]
-        is_rotated = post_processor.postprocess_cls([cls_result])[0]
+        # 修改后的正确代码
+        cls_output = run_cls_model(cls_model, cls_input)  # 获取模型输出
+        cls_result = np.array(cls_output)  # 确保转换为numpy数组
+        is_rotated = post_processor.postprocess_cls(cls_result)[0]
 
         if is_rotated == 1:
             cropped = cv2.rotate(cropped, cv2.ROTATE_180)
 
         # === 4. 识别模型 ===
-        rec_data = pre_processor.preprocess_for_task(cropped, task_type='rec',batch_size=2)
+        rec_data = pre_processor.preprocess_for_task(
+            cropped,
+            task_type='rec',
+            batch_size=1,
+            target_height=32,
+            max_width=320,
+            mean=[0.5, 0.5, 0.5],
+            std = [0.5, 0.5, 0.5],
+            scale=1.0 / 255.0
+        )
 
         # 识别模型推理
         rec_input = np.expand_dims(rec_data['image'], axis=0)
@@ -167,12 +202,17 @@ def ocr_pipeline(image_path):
         text = post_processor.ctc_decode(rec_pred, charset)
         texts.append(text)
 
+        if text.strip() == "":
+            cv2.imwrite(f"result/debug_empty_box_{i}.png", cropped)
+
     # === 输出结果 ===
     print("[识别结果]")
-    visualize_boxes('road.jpg', boxes)
+    visualize_boxes('gpt.png', boxes)
+
+
     for i, text in enumerate(texts):
         print(f"Box {i + 1}: {text}")
 
 # === 执行测试 ===
 if __name__ == "__main__":
-    ocr_pipeline("road.jpg")
+    ocr_pipeline("gpt.png")
