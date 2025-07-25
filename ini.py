@@ -18,7 +18,7 @@ def load_paddle_model(model_dir):
         model_dir + "/inference.pdmodel",
         model_dir + "/inference.pdiparams"
     )
-    #config.enable_use_gpu(1024, 0)  # 使用 GPU，如使用 CPU 可注释掉这行
+    config.enable_use_gpu(1024, 0)  # 使用 GPU，如使用 CPU 可注释掉这行
     predictor = paddle_infer.create_predictor(config)
     return predictor
 
