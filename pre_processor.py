@@ -43,6 +43,16 @@ class DetResizeForTest:
         self.divisor = divisor
 
     def __call__(self, data):
+        if isinstance(data, list):  # 批处理模式
+            batch_data = []
+            for item in data:
+                processed = self._process_single(item)
+                batch_data.append(processed)
+            return batch_data
+        else:  # 单张图片模式
+            return self._process_single(data)
+
+    def _process_single(self, data):
         img = data['image']
         h, w = img.shape[:2]
 
@@ -108,7 +118,7 @@ class ClsResizeForTest:
 class RecResizeForTest:
     """识别专用尺寸调整算子"""
 
-    def __init__(self, image_shape=(3, 32, 320)):
+    def __init__(self, image_shape=(3, 48, 320)):#中间onnx为48，原版32
         # 初始化参数：目标高度、最大宽度限制、最小宽度限制
         self.image_shape = image_shape
 
@@ -137,6 +147,7 @@ class RecResizeForTest:
         data['image'] = resized_img
         # 存储调整后的尺寸
         data['resized_shape'] = (imgH, imgW)
+
         return data
 
 
@@ -200,28 +211,24 @@ class BatchPadding:
         self.max_width = max_width
 
     def __call__(self, batch_data):
-        # 获取最大尺寸
+        # 获取最大尺寸时应考虑通道维度
+        max_c = max([d['image'].shape[0] for d in batch_data])  # 新增：获取最大通道数
         max_h = max([d['image'].shape[1] for d in batch_data])
         max_w = max([d['image'].shape[2] for d in batch_data])
 
-        if self.max_width:
-            max_w = min(max_w, self.max_width)
-
         # 创建批处理数组
         batch_images = []
-
         for data in batch_data:
             img = data['image']
             c, h, w = img.shape
 
-            # 创建填充后的图像
-            padded_img = np.full((c, max_h, max_w), self.pad_value, dtype=img.dtype)
-            padded_img[:, :h, :w] = img[:, :, :min(w, max_w)]
+            # 确保通道维度一致
+            padded_img = np.full((max_c, max_h, max_w), self.pad_value, dtype=img.dtype)
+            padded_img[:c, :h, :w] = img[:min(c, max_c), :, :min(w, max_w)]
 
             batch_images.append(padded_img)
 
         return {'image': np.array(batch_images)}
-
 
 def create_preprocess_pipeline(task_type, config):
     """创建预处理流水线"""
@@ -246,7 +253,9 @@ def create_preprocess_pipeline(task_type, config):
         pipeline.append(KeepKeys(keep_keys=['image', 'shape', 'ratio_h', 'ratio_w', 'ori_shape']))
     elif task_type == 'cls':
         pipeline.append(ClsResizeForTest(
-            image_shape=config.get('image_shape', (3, 48, 192))
+
+            image_shape=config.get('image_shape', (3, 48, 192))#中间onnx为48，原版32
+
         ))
         pipeline.append(NormalizeImage(
             mean=config.get('mean', [0.5, 0.5, 0.5]),
@@ -257,7 +266,7 @@ def create_preprocess_pipeline(task_type, config):
         pipeline.append(KeepKeys(keep_keys=['image']))
     elif task_type == 'rec':
         pipeline.append(RecResizeForTest(
-            image_shape=config.get('image_shape', (3, 32, 320))
+            image_shape=config.get('image_shape', (3, 48, 320))
         ))
         pipeline.append(NormalizeImage(
             mean=config.get('mean', [0.5, 0.5, 0.5]),
@@ -315,20 +324,26 @@ if __name__ == "__main__":
         'mean': [0.5, 0.5, 0.5],
         'std': [0.5, 0.5, 0.5]
     }
-    det_data = preprocess_for_task('mars.png', 'det', **det_config)
+
+    images =['ocr_upload/mars.png', 'ocr_upload/gpt.png', 'ocr_upload/csdn.png']
+    det_data = preprocess_for_task(images,
+                                   'det',
+                                   batch_size=3,  # 可以设置为实际图片数量或更大的批处理大小
+                                   **det_config)
     print("检测预处理结果:", det_data['image'].shape)
 
     # 识别任务示例
 
     rec_config = {
-        'image_shape': (3, 32, 320),  # 明确指定图像形状
+        'image_shape': (3, 48, 320),  # 明确指定图像形状
         'mean': [0.5, 0.5, 0.5],
         'std': [0.5, 0.5, 0.5],
         'scale': 1.0 / 255.0
     }
-    rec_data = preprocess_for_task('mars.png', 'rec', **rec_config)
+    rec_data = preprocess_for_task(images, 'rec', **rec_config)
     print("识别预处理结果:", rec_data['image'].shape)
 
+
     # 批处理示例 (2张图像)
-    batch_data = preprocess_for_task(['mars.png'], 'det', batch_size=1)
+    batch_data = preprocess_for_task(images, 'det', batch_size=3)
     print("批处理结果:", batch_data['image'].shape)

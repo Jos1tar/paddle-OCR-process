@@ -69,7 +69,7 @@ def run_rec_model(session, input_tensor):
     :param input_tensor: shape = [1, 3, 32, W]
     :return: shape = [T, num_classes]，T为时间步
     """
-    output = run_onnx_model(session, input_tensor)  # shape: [1, T, num_classes]
+    output = run_onnx_model(session, input_tensor)  # shape: [1, T, num_classes],此处如果使用 ONNX model，num_classes是48
     return output[0]  # 去掉 batch 维度，得到 [T, num_classes]
 
 
