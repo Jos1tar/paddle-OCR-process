@@ -1,3 +1,4 @@
+
 import os
 import cv2
 import numpy as np
@@ -115,92 +116,97 @@ def visualize_boxes(image_path, boxes, save_path='result/debug_boxes.jpg'):
     return save_path
 
 
-def ocr_pipeline(image_path="orc_upload/gpt.png"):
-    print("字符集大小:", len(charset))
-    print("前10个字符:", charset[:10])
+def ocr_pipeline(image_paths):
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
 
-    test_text = "测试123"
-    print("字符集包含测试字符:", all(c in charset for c in test_text))
+    results = []
 
-    # 1. 检测阶段
-    det_config = {
-        'limit_side_len': 960,
-        'mean': [0.485, 0.456, 0.406],
-        'std': [0.229, 0.224, 0.225]
-    }
-    det_data = pre_processor.preprocess_for_task(image_path, task_type='det', **det_config)
-    det_input = np.expand_dims(det_data['image'], axis=0)
-
-    # 加载 ONNX 模型
-    det_model = load_onnx_model('./onnx_models/det/det_model.onnx')
-    cls_model = load_onnx_model('./onnx_models/cls/cls_model.onnx')
-    rec_model = load_onnx_model('./onnx_models/rec/rec_model.onnx')
-
-    det_pred = run_det_model(det_model, det_input)
-    ori_shape = det_data['ori_shape']
-    resize_shape = det_data['shape']
-    boxes = post_processor.postprocess_det(det_pred, ori_shape, resize_shape)
-
-    print(f"[检测] 共检测到 {len(boxes)} 个文本框")
-
-    image = cv2.imread(image_path)
-    texts = []
-
-    for i, box in enumerate(boxes):
-        cropped = get_rotate_crop_image(image, box)
-        if cropped is None:
-            continue
-
-        # 分类
-        rec_config = {
-            'target_height': 32,
-            'max_width': 320,
-            'mean': [0.5, 0.5, 0.5],
-            'std': [0.5, 0.5, 0.5],
+    for image_path in image_paths:
+        print(f"\n===== 正在处理: {image_path} =====")
+        # 1. 检测阶段
+        det_config = {
+            'limit_side_len': 960,
+            'mean': [0.485, 0.456, 0.406],
+            'std': [0.229, 0.224, 0.225]
         }
-        cls_data = pre_processor.preprocess_for_task(cropped, task_type='cls', **rec_config)
-        cls_input = np.expand_dims(cls_data['image'], axis=0)
-        cls_result = run_cls_model(cls_model, cls_input)
-        is_rotated = post_processor.postprocess_cls(cls_result)[0]
-        if is_rotated == 1:
-            cropped = cv2.rotate(cropped, cv2.ROTATE_180)
+        det_data = pre_processor.preprocess_for_task(image_path, task_type='det', **det_config)
+        det_input = np.expand_dims(det_data['image'], axis=0)
 
-        # 识别
-        rec_data = pre_processor.preprocess_for_task(
-            cropped,
-            task_type='rec',
-            batch_size=1,
-            target_height=32,
-            max_width=320,
-            mean=[0.5, 0.5, 0.5],
-            std=[0.5, 0.5, 0.5],
-            scale=1.0 / 255.0
-        )
-        rec_input = np.expand_dims(rec_data['image'], axis=0)
-        rec_pred = run_rec_model(rec_model, rec_input)
-        text = post_processor.ctc_decode(rec_pred, charset)
-        texts.append(text)
+        # 加载 ONNX 模型
+        det_model = load_onnx_model('./onnx_models/det/det_model.onnx')
+        cls_model = load_onnx_model('./onnx_models/cls/cls_model.onnx')
+        rec_model = load_onnx_model('./onnx_models/rec/rec_model.onnx')
 
-        if text.strip() == "":
-            os.makedirs("result", exist_ok=True)
-            cv2.imwrite(f"result/debug_empty_box_{i}.png", cropped)
+        det_pred = run_det_model(det_model, det_input)
+        ori_shape = det_data['ori_shape']
+        resize_shape = det_data['shape']
+        boxes = post_processor.postprocess_det(det_pred, ori_shape, resize_shape)
 
-    # 输出可视化（可选）
-    print("[识别结果]")
-    for i, text in enumerate(texts):
-        print(f"Box {i + 1}: {text}")
+        print(f"[检测] 共检测到 {len(boxes)} 个文本框")
 
-    visualize_path = visualize_boxes(image_path, boxes)
+        image = cv2.imread(image_path)
+        texts = []
 
-    return {
-        "texts": texts,
-        "num_boxes": len(boxes),
-        "image_path": image_path,
-        "result_image_path": visualize_path
-    }
+        for i, box in enumerate(boxes):
+            cropped = get_rotate_crop_image(image, box)
+            if cropped is None:
+                continue
 
+            # 分类
+            rec_config = {
+                'target_height': 32,
+                'max_width': 320,
+                'mean': [0.5, 0.5, 0.5],
+                'std': [0.5, 0.5, 0.5],
+            }
+            cls_data = pre_processor.preprocess_for_task(cropped, task_type='cls', **rec_config)
+            cls_input = np.expand_dims(cls_data['image'], axis=0)
+            cls_result = run_cls_model(cls_model, cls_input)
+            is_rotated = post_processor.postprocess_cls(cls_result)[0]
+            if is_rotated == 1:
+                cropped = cv2.rotate(cropped, cv2.ROTATE_180)
+
+            # 识别
+            rec_data = pre_processor.preprocess_for_task(
+                cropped,
+                task_type='rec',
+                batch_size=1,
+                target_height=32,
+                max_width=320,
+                mean=[0.5, 0.5, 0.5],
+                std=[0.5, 0.5, 0.5],
+                scale=1.0 / 255.0
+            )
+            rec_input = np.expand_dims(rec_data['image'], axis=0)
+            rec_pred = run_rec_model(rec_model, rec_input)
+            text = post_processor.ctc_decode(rec_pred, charset)
+            texts.append(text)
+
+            if text.strip() == "":
+                os.makedirs("result", exist_ok=True)
+                cv2.imwrite(f"result/debug_empty_box_{i}.png", cropped)
+
+        # 输出可视化（可选）
+        print("[识别结果]")
+        for i, text in enumerate(texts):
+            print(f"Box {i + 1}: {text}")
+
+        visualize_path = visualize_boxes(image_path, boxes)
+
+        results.append({
+            "texts": texts,
+            "num_boxes": len(boxes),
+            "image_path": image_path,
+            "result_image_path": visualize_path
+        })
+
+    return results
 
 # === 执行测试 ===
 if __name__ == "__main__":
     # 测试 ONNX 推理
-    ocr_pipeline("ocr_upload/gpt.png")
+    images = ["ocr_upload/gpt.png", "ocr_upload/mars.png", "ocr_upload/csdn.png"]
+    results = ocr_pipeline(images)
+    for res in results:
+        print(res["image_path"], "识别文本：", res["texts"])
