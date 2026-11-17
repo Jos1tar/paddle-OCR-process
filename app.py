@@ -7,9 +7,9 @@ import shutil
 import os
 import numpy as np
 import sys
-from test import ocr_pipeline
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+from ini import ocr_pipeline  # 原来是 `from test import ...`，仓库里没有 test.py
 
 
 app = FastAPI()
@@ -53,11 +53,11 @@ async def upload_image(file: UploadFile = File(...)):
 
 
 
-@app.post("/orcpredict/")
+@app.post("/ocrpredict/")
 async def predict(
     file: UploadFile = File(None),
     use_default: bool = False,
-    DEFAULT_IMAGE_PATH: str = "orc_upload/gpt.png"
+    DEFAULT_IMAGE_PATH: str = "ocr_upload/gpt.png"
 ):
     try:
         # 决定使用哪张图片
@@ -68,10 +68,10 @@ async def predict(
                 raise HTTPException(status_code=400, detail=f"默认图片不存在，也未上传图片 (路径: {image_path})")
         else:
             # 处理上传图片
-            os.makedirs("orc_upload", exist_ok=True)
+            os.makedirs("ocr_upload", exist_ok=True)
             file_ext = os.path.splitext(file.filename)[-1]
             filename = f"{uuid.uuid4().hex}{file_ext}"
-            image_path = os.path.join("orc_upload", filename)
+            image_path = os.path.join("ocr_upload", filename)
             with open(image_path, "wb") as f:
                 shutil.copyfileobj(file.file, f)
             print(f"[DEBUG] 上传图片保存路径: {image_path}")

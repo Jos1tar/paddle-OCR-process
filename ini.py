@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -9,6 +10,7 @@ import post_processor
 
 
 
+@lru_cache(maxsize=None)  # 原来每个请求重新加载三个模型
 def load_paddle_model(model_dir):
     """
     加载 Paddle 推理模型（.pdmodel/.pdiparams）
@@ -18,7 +20,8 @@ def load_paddle_model(model_dir):
         model_dir + "/inference.pdmodel",
         model_dir + "/inference.pdiparams"
     )
-    config.enable_use_gpu(1024, 0)  # 使用 GPU，如使用 CPU 可注释掉这行
+    if os.environ.get("OCR_USE_GPU", "0") == "1":  # 原来硬编码 GPU，CPU 环境/容器里直接报错
+        config.enable_use_gpu(1024, 0)
     predictor = paddle_infer.create_predictor(config)
     return predictor
 
@@ -116,7 +119,7 @@ def load_charset(txt_path):
         charset = [line.strip() for line in f]
     return ['blank'] + charset  # 第一个为 CTC blank
 
-charset = load_charset('ppocr_keys_v1.txt')
+charset = load_charset(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ppocr_keys_v1.txt'))
 
 def visualize_boxes(image_path, boxes, save_path='result/debug_boxes.jpg'):
     img = cv2.imread(image_path)
@@ -127,7 +130,7 @@ def visualize_boxes(image_path, boxes, save_path='result/debug_boxes.jpg'):
     cv2.imwrite(save_path, img)
     return save_path
 
-def ocr_pipeline(image_path="orc_upload/gpt.png"):
+def ocr_pipeline(image_path="ocr_upload/gpt.png"):
 
     print("字符集大小:", len(charset))
     print("前10个字符:", charset[:10])
